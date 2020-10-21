@@ -8,6 +8,7 @@ from odoo import models, fields, api, tools, SUPERUSER_ID, sql_db, registry
 from odoo.service import db
 from odoo.service.model import execute
 from odoo.addons.queue_job.job import job
+from odoo.http import _request_stack
 
 MANDATORY_MODULES = ['auth_quick']
 
@@ -21,7 +22,7 @@ class SAASOperator(models.Model):
     type = fields.Selection([
         ('local', 'Same Instance'),
     ], 'Type')
-    direct_url = fields.Char('Master URL (Server-to-Server)', required=True, help='URL for server-to-server communication ')
+    global_url = fields.Char('Master URL (Server-to-Server)', required=True, help='URL for server-to-server communication ')
     # host = fields.Char()
     # port = fields.Char()
     db_url_template = fields.Char('DB URLs', help='Avaialble variables: {db_id}, {db_name}')
@@ -70,13 +71,25 @@ class SAASOperator(models.Model):
             db = sql_db.db_connect(template_operator_id.operator_db_name)
             with api.Environment.manage(), db.cursor() as cr:
                 env = api.Environment(cr, SUPERUSER_ID, {})
+
+                # Set odoo.http.request to None.
+                #
+                # Odoo tries to use its values in translation system, which may eventually
+                # change currentThread().dbname to saas master value.
+                _request_stack.push(None)
+
                 module_ids = env['ir.module.module'].search([('state', '=', 'uninstalled')] + modules)
                 module_ids.button_immediate_install()
+
                 # Some magic to force reloading registry in other workers
                 env.registry.registry_invalidated = True
                 env.registry.signal_changes()
-                template_operator_id.state = 'post_init'
-                self.with_delay().post_init(template_id, template_operator_id)
+
+                # return request back
+                _request_stack.pop()
+
+            template_operator_id.state = 'post_init'
+            self.with_delay().post_init(template_id, template_operator_id)
 
     @job
     def post_init(self, template_id, template_operator_id):
@@ -107,7 +120,7 @@ class SAASOperator(models.Model):
     def _get_mandatory_args(self, db):
         self.ensure_one()
         return {
-            'master_url': self.direct_url,
+            'master_url': self.global_url,
             'build_id': db.id
         }
 
@@ -137,11 +150,11 @@ class SAASOperator(models.Model):
         self.build_execute_kw(build, 'ir.actions.server', 'run', [action_ids])
 
     def write(self, vals):
-        if 'direct_url' in vals:
-            self._update_direct_url(vals['direct_url'])
+        if 'global_url' in vals:
+            self._update_global_url(vals['global_url'])
         return super(SAASOperator, self).write(vals)
 
-    def _update_direct_url(self, url):
+    def _update_global_url(self, url):
         self.ensure_one()
         code = "env['ir.config_parameter'].set_param('auth_quick.master', '{}')\n".format(url)
         builds = self.env['saas.db'].search([('operator_id', '=', self.id), ('type', '=', 'build')])
@@ -154,6 +167,15 @@ class SAASOperator(models.Model):
         for build in builds:
             action_ids = self.build_execute_kw(build, 'ir.actions.server', 'create', [action])
             self.build_execute_kw(build, 'ir.actions.server', 'run', [action_ids])
+
+    def notify_users(self, message, title=None, message_type=None):
+        manager_users = self.env.ref('saas.group_manager').users
+        if message_type == 'success':
+            manager_users.notify_success(message=message, title=title, sticky=True)
+        elif message_type == 'info':
+            manager_users.notify_info(message=message, title=title, sticky=True)
+        else:
+            manager_users.notify_default(message=message, title=title, sticky=True)
 
 
 class SafeDict(defaultdict):
